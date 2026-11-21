@@ -661,7 +661,8 @@ int main() {
             size_t e = min(lsz, (i + 1) * 65536);
             for (size_t k = i * 65536; k < e; k++) SL[k].store(0, memory_order_relaxed);
         });
-        vector<int> parent(lsz);
+        unique_ptr<int[]> parent_a(new int[lsz]);
+        int* parent = parent_a.get();
         vector<vector<int>> ends(ch.size());
         par(ch.size(), [&](size_t c, int) {
             auto& v = pairs[c]; auto& h = hs[c]; auto& out = ends[c];
@@ -695,37 +696,34 @@ int main() {
                 if (x != y) { if (x < y) parent[y] = x; else parent[x] = y; }
             }
         // one ascending pass makes every parent a root
+        unique_ptr<atomic<int>[]> best_a(new atomic<int>[lsz]);
+        atomic<int>* best = best_a.get();
         size_t n = 0;
         for (size_t k = 0; k < lsz; k++)
-            if (SL[k].load(memory_order_relaxed)) { parent[k] = parent[parent[k]]; n++; }
-        vector<int> best(lsz, -1);
-        par(NT, [&](size_t t, int) {
-            for (size_t k = 0; k < lsz; k++) {
+            if (SL[k].load(memory_order_relaxed)) {
+                parent[k] = parent[parent[k]]; n++;
+                if (parent[k] == (int)k) best[k].store((int)k, memory_order_relaxed);
+            }
+        // byte-wise smallest ID per component, by CAS
+        const size_t BLK = 65536, NBLK = (lsz + BLK - 1) / BLK;
+        par(NBLK, [&](size_t i, int) {
+            size_t e = min(lsz, (i + 1) * BLK);
+            for (size_t k = i * BLK; k < e; k++) {
                 if (!SL[k].load(memory_order_relaxed)) continue;
-                int r = parent[k];
-                if ((size_t)(mix64((u64)r) % NT) != t) continue;
-                int& bb = best[r];
-                if (bb < 0 || scmp(LE[k].id, LE[k].idlen, LE[bb].id, LE[bb].idlen) < 0) bb = (int)k;
+                atomic<int>& bb = best[parent[k]];
+                int cur = bb.load(memory_order_relaxed);
+                while (scmp(LE[k].id, LE[k].idlen, LE[cur].id, LE[cur].idlen) < 0 &&
+                       !bb.compare_exchange_weak(cur, (int)k, memory_order_relaxed)) {}
             }
         });
-        vector<u64> nh(lsz);
         lk_a.reset(new LinkKey[lsz]);
         LinkKey* LK = lk_a.get();
-        par((lsz + 65535) / 65536, [&](size_t i, int) {
-            size_t e = min(lsz, (i + 1) * 65536);
-            memset((void*)(LK + i * 65536), 0, (e - i * 65536) * sizeof(LinkKey));
-        });
-        par((lsz + 65535) / 65536, [&](size_t i, int) {
-            size_t e = min(lsz, (i + 1) * 65536);
-            for (size_t k = i * 65536; k < e; k++) if (SL[k].load(memory_order_relaxed)) nh[k] = LE[k].nameh;
-        });
-        par((lsz + 65535) / 65536, [&](size_t i, int) {
-            size_t e = min(lsz, (i + 1) * 65536);
-            for (size_t k = i * 65536; k < e; k++) {
-                if (!SL[k].load(memory_order_relaxed)) continue;
-                int bb = best[parent[k]];
-                LE[k].name = LE[bb].id; LE[k].namelen = LE[bb].idlen; LE[k].nameh = nh[bb];
-                LK[k] = LinkKey{nh[k], nh[bb], LE[bb].id, LE[bb].idlen, 1};
+        par(NBLK, [&](size_t i, int) {
+            size_t e = min(lsz, (i + 1) * BLK);
+            for (size_t k = i * BLK; k < e; k++) {
+                if (!SL[k].load(memory_order_relaxed)) { LK[k].occ = 0; continue; }
+                int bb = best[parent[k]].load(memory_order_relaxed);
+                LK[k] = LinkKey{LE[k].nameh, LE[bb].nameh, LE[bb].id, LE[bb].idlen, 1};
             }
         });
         fprintf(stderr, "links: %zu ids\n", n);
