@@ -433,23 +433,22 @@ static inline bool parse_ts(const char* p, u32 n, i64& out) {
 }
 
 // ---------------------------------------------------------------- records
-struct EvRec {      // a parsed event copy, partitioned by event_id hash
+// Dedup index entry for one parsed event copy, bucketed by event_id hash (32 bytes).
+// The payload of a valid copy is already in its person partition; ref locates it there
+// so that a losing copy can be killed in place.
+struct DRec {
     u64 h;
-    u64 uh;         // hash of user
     const char* eid;
-    const char* user;
-    i64 ts;
     i64 ingest;
     u32 eidlen;
-    u32 userlen;
-    int32_t price;  // >0 for a purchase
-    uint8_t cat;
-    uint8_t valid;  // bit0 valid, bit1 lost dedup
+    u32 ref;        // NOREF if this copy is invalid (it can still win dedup and drop the event)
 };
-struct PRec {       // a surviving event, partitioned by person (32 bytes)
+static const u32 NOREF = 0xFFFFFFFFu;
+static const u32 KILLED = 1u << 31;   // PRec.ts flag: lost dedup
+struct PRec {       // a valid event copy, partitioned by person (32 bytes)
     u64 h;
     const char* name;
-    u32 ts;         // ms since window_start (a valid event is inside the window)
+    u32 ts;         // ms since window_start (< 2^31, a valid event is inside the window); KILLED flag
     u32 namelen;
     u32 pc;         // price | cat << 24 (price is 0 or 1..10,000,000 < 2^24)
 };
@@ -600,6 +599,9 @@ static void put_def_levels(Buf& out, const vector<uint8_t>& defs) {
 // ---------------------------------------------------------------- main
 struct URow { const char* name; u32 namelen; int32_t day; i64 sessions, events, revenue; int topcat; };
 struct CAgg { i64 sessions, purch, rev, assist; };
+
+// Present only in -fprofile-generate builds; lets the PGO training run save its profile.
+extern "C" void __gcov_dump() __attribute__((weak));
 
 int main() {
     const char* ev;
@@ -792,43 +794,58 @@ int main() {
         }
     };
 
+    // Bitmap prefilter over linked user hashes: most users have no links, and for them
+    // this 2 MB bitmap answers without touching the big link table.
+    const int LBB = 24;
+    vector<u64> lbits((size_t)1 << (LBB - 6), 0);
+    for (u64 k = 0; k <= lmask; k++)
+        if (lk[k].occ) { u64 b = lk[k].idh >> (64 - LBB); lbits[b >> 6] |= 1ULL << (b & 63); }
+    auto maybe_linked = [&](u64 h) -> bool { u64 b = h >> (64 - LBB); return (lbits[b >> 6] >> (b & 63)) & 1; };
+
     // ------------------------------------------------ parse events and clicks
+    // Each valid event copy goes straight to its person partition (links are already
+    // resolved); dedup then only needs a compact index of event ids.
     const int BSH = 9, NB = 1 << BSH;   // event-id buckets
     const int QSH = 9, NQ = 1 << QSH;   // person partitions
-    vector<vector<vector<EvRec>>> evb(NT, vector<vector<EvRec>>(NB));
-    size_t EST_EV = 0;
+    int TB = 0; while ((1 << TB) < NT) TB++;
+    const int IB = 32 - TB - QSH;       // ref = tid | partition | index
+    const u32 IMAX = (1u << IB) - 1;    // index IMAX would collide with NOREF
+    vector<vector<vector<DRec>>> evb(NT, vector<vector<DRec>>(NB));
+    vector<vector<vector<PRec>>> evq(NT, vector<vector<PRec>>(NQ));
     vector<vector<vector<CRec>>> clq(NT, vector<vector<CRec>>(NQ));
+    atomic<bool> ref_overflow{false};
     {
         vector<Chunk> ech = make_chunks(evf, 8 << 20), cch = make_chunks(clf, 8 << 20);
         size_t ne = ech.size();
         size_t evbytes = 0, clbytes = 0;
         for (auto& c : ech) evbytes += c.e - c.b;
         for (auto& c : cch) clbytes += c.e - c.b;
-        EST_EV = evbytes / 80;
+        size_t EST_EV = evbytes / 80;
         size_t per_e = (size_t)(EST_EV * 1.2 / NB / NT) + 16, per_c = (size_t)(clbytes / 40 * 1.2 / NQ / NT) + 16;
+        size_t per_q = (size_t)(EST_EV * 1.15 / NQ / NT) + 16;
         par(NT, [&](size_t t, int) {
             for (auto& v : evb[t]) v.reserve(per_e);
+            for (auto& v : evq[t]) v.reserve(per_q);
             for (auto& v : clq[t]) v.reserve(per_c);
         });
-        // sort chunks by size, largest first, for balance
         par(ne + cch.size(), [&](size_t i, int tid) {
             if (i < ne) {
                 auto& B = evb[tid];
+                auto& Q = evq[tid];
+                const u32 tref = (u32)tid << (QSH + IB);
                 scan_lines<7>(ech[i], [&](Fld* f) {
                     if (f[0].n == 0) return;
-                    EvRec r;
+                    DRec r;
                     r.eid = f[0].p; r.eidlen = f[0].n;
                     r.h = hash_str(r.eid, r.eidlen);
-                    r.user = f[1].p; r.userlen = f[1].n;
-                    r.uh = hash_str(r.user, r.userlen);
+                    r.ref = NOREF;
                     i64 ing;
                     if (!parse_ts(f[3].p, f[3].n, ing)) ing = INT64_MAX;
                     r.ingest = ing;
-                    r.price = 0; r.cat = 0;
+                    u32 price = 0, cat = 0;
                     bool ok = f[1].n > 0 && f[5].n > 0;
                     i64 ts = 0;
                     if (ok) ok = parse_ts(f[2].p, f[2].n, ts) && ts >= WS && ts < WE && ing - ts <= DAY_MS;
-                    r.ts = ts;
                     if (ok) {
                         const char* t = f[4].p; u32 tn = f[4].n;
                         if (tn == 4 && (memcmp(t, "view", 4) == 0 || memcmp(t, "cart", 4) == 0)) {
@@ -844,15 +861,28 @@ int main() {
                                     i64 v = 0; for (; j < qn; j++) v = v * 10 + (q[j] - '0');
                                     if (v < 1 || v > 10000000) ok = false;
                                     else {
-                                        r.price = (int32_t)v;
+                                        price = (u32)v;
                                         int c = prodmap.find(f[5].p, f[5].n);
-                                        r.cat = (uint8_t)(c < 0 ? UNKNOWN : c);
+                                        cat = (u32)(c < 0 ? UNKNOWN : c);
                                     }
                                 }
                             }
                         } else ok = false;
                     }
-                    r.valid = ok;
+                    if (ok) {
+                        PRec p;
+                        u64 uh = hash_str(f[1].p, f[1].n);
+                        int id = maybe_linked(uh) ? lfind(uh) : -1;
+                        if (id >= 0) { p.name = lk[id].name; p.namelen = lk[id].namelen; p.h = lk[id].nameh; }
+                        else { p.name = f[1].p; p.namelen = f[1].n; p.h = uh; }
+                        p.ts = (u32)(ts - WS); p.pc = price | (cat << 24);
+                        u32 q = (u32)(p.h >> (64 - QSH));
+                        auto& V = Q[q];
+                        size_t idx = V.size();
+                        if (idx < IMAX) r.ref = tref | (q << IB) | (u32)idx;
+                        else ref_overflow.store(true, memory_order_relaxed);
+                        V.push_back(p);
+                    }
                     B[r.h >> (64 - BSH)].push_back(r);
                 });
             } else {
@@ -876,64 +906,42 @@ int main() {
         });
     }
     logt("parse");
+    if (ref_overflow.load()) { fprintf(stderr, "event partition index overflow\n"); exit(3); }
 
-    // ------------------------------------------------ dedup events, scatter by person
-    vector<vector<vector<PRec>>> evq(NT, vector<vector<PRec>>(NQ));
-    {
-        size_t per = (size_t)(EST_EV * 1.15 / NQ / NT) + 16;
-        par(NT, [&](size_t t, int) { for (auto& v : evq[t]) v.reserve(per); });
-    }
-    par(NB, [&](size_t b, int tid) {
+    // ------------------------------------------------ dedup: keep the copy with the smallest ingest_ts
+    // Every other copy that has a payload is killed in its person partition. Equal ingest_ts
+    // copies are identical, so either may stay. An invalid winner has no payload: the event drops.
+    const u32 QMASK = (1u << QSH) - 1;
+    auto kill = [&](u32 ref) {
+        if (ref != NOREF) evq[ref >> (QSH + IB)][(ref >> IB) & QMASK][ref & IMAX].ts |= KILLED;
+    };
+    par(NB, [&](size_t b, int) {
         size_t n = 0;
         for (int t = 0; t < NT; t++) n += evb[t][b].size();
         size_t sz = 16; while (sz < n * 2) sz <<= 1;
         u64 mask = sz - 1;
         vector<u64> tab(sz, 0);   // (tag << 32) | (code + 1)
-        auto rec = [&](u32 code) -> EvRec& { return evb[code >> 27][b][code & ((1u << 27) - 1)]; };
+        auto rec = [&](u32 code) -> DRec& { return evb[code >> 27][b][code & ((1u << 27) - 1)]; };
         for (int t = 0; t < NT; t++) {
             auto& v = evb[t][b];
             for (u32 i = 0; i < v.size(); i++) {
-                EvRec& r = v[i];
+                DRec& r = v[i];
                 u32 code = ((u32)t << 27) | i;
                 u32 tag = (u32)(r.h >> 22);
                 for (u64 k = (r.h >> 3) & mask;; k = (k + 1) & mask) {
                     u64 e = tab[k];
                     if (!e) { tab[k] = ((u64)tag << 32) | (code + 1); break; }
                     if ((u32)(e >> 32) != tag) continue;
-                    EvRec& o = rec((u32)e - 1);
+                    DRec& o = rec((u32)e - 1);
                     if (o.h == r.h && seq(o.eid, o.eidlen, r.eid, r.eidlen)) {
-                        if (r.ingest < o.ingest) { o.valid |= 2; tab[k] = ((u64)tag << 32) | (code + 1); }
-                        else r.valid |= 2;
+                        if (r.ingest < o.ingest) { kill(o.ref); tab[k] = ((u64)tag << 32) | (code + 1); }
+                        else kill(r.ref);
                         break;
                     }
                 }
             }
         }
-        vector<u64>().swap(tab);
-        auto& Q = evq[tid];
-        const int BATCH = 32;
-        const EvRec* bat[BATCH];
-        auto flush = [&](int m) {
-            for (int j = 0; j < m; j++) __builtin_prefetch(&lk[bat[j]->uh & lmask]);
-            for (int j = 0; j < m; j++) {
-                const EvRec& r = *bat[j];
-                PRec p;
-                int id = lfind(r.uh);
-                if (id >= 0) { p.name = lk[id].name; p.namelen = lk[id].namelen; p.h = lk[id].nameh; }
-                else { p.name = r.user; p.namelen = r.userlen; p.h = r.uh; }
-                p.ts = (u32)(r.ts - WS); p.pc = (u32)r.price | ((u32)r.cat << 24);
-                Q[p.h >> (64 - QSH)].push_back(p);
-            }
-        };
-        int m = 0;
-        for (int t = 0; t < NT; t++)
-            for (auto& r : evb[t][b]) {
-                if (r.valid != 1) continue;
-                bat[m++] = &r;
-                if (m == BATCH) { flush(m); m = 0; }
-            }
-        if (m) flush(m);
-        for (int t = 0; t < NT; t++) { vector<EvRec>().swap(evb[t][b]); }
+        for (int t = 0; t < NT; t++) { vector<DRec>().swap(evb[t][b]); }
     });
     logt("dedup");
 
@@ -959,6 +967,7 @@ int main() {
         vector<u32> cnt;
         for (int t = 0; t < NT; t++)
             for (auto& r : evq[t][q]) {
+                if (r.ts & KILLED) continue;
                 int id;
                 for (u64 k = (r.h >> 2) & mask;; k = (k + 1) & mask) {
                     if (tab[k] < 0) { id = tab[k] = (int)pers.size(); pers.push_back(PK{r.h, r.name, r.namelen}); cnt.push_back(0); break; }
@@ -977,7 +986,7 @@ int main() {
             vector<u32> pos(start.begin(), start.end() - 1);
             size_t j = 0;
             for (int t = 0; t < NT; t++)
-                for (auto& r : evq[t][q]) evs[pos[pid[j++]]++] = E{r.ts, r.pc};
+                for (auto& r : evq[t][q]) if (!(r.ts & KILLED)) evs[pos[pid[j++]]++] = E{r.ts, r.pc};
         }
         for (int t = 0; t < NT; t++) vector<PRec>().swap(evq[t][q]);
         // clicks
@@ -1136,5 +1145,6 @@ int main() {
     });
     logt("write");
     fflush(stderr);
+    if (__gcov_dump) __gcov_dump();  // _exit skips the profile writer
     _exit(0);
 }
