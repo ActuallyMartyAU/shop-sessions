@@ -1,0 +1,6 @@
+data/
+out/
+build/
+vendor/
+.venv/
+dev/
