@@ -709,12 +709,16 @@ int main() {
         lent_a.reset(new LinkEnt[lsz]);
         atomic<u64>* SL = lslots_a.get();
         LinkEnt* LE = lent_a.get();
+        unique_ptr<int[]> parent_a(new int[lsz]);
+        int* parent = parent_a.get();
+        // Zero the slots and pre-fault the entry and parent arrays in parallel, so the random
+        // inserts below don't take their page faults one at a time.
         par((lsz + 65535) / 65536, [&](size_t i, int) {
             size_t e = min(lsz, (i + 1) * 65536);
             for (size_t k = i * 65536; k < e; k++) SL[k].store(0, memory_order_relaxed);
+            memset((void*)(LE + i * 65536), 0, (e - i * 65536) * sizeof(LinkEnt));
+            memset((void*)(parent + i * 65536), 0, (e - i * 65536) * sizeof(int));
         });
-        unique_ptr<int[]> parent_a(new int[lsz]);
-        int* parent = parent_a.get();
         vector<vector<int>> ends(ch.size());
         par(ch.size(), [&](size_t c, int) {
             auto& v = pairs[c]; auto& h = hs[c]; auto& out = ends[c];
@@ -747,17 +751,40 @@ int main() {
                 int x = findp(out[k]), y = findp(out[k + 1]);
                 if (x != y) { if (x < y) parent[y] = x; else parent[x] = y; }
             }
-        // one ascending pass makes every parent a root
+        // Point every slot at its root by parallel pointer jumping (parent[k] = parent[parent[k]]
+        // until nothing changes; O(log depth) passes). Each slot is written only by its own block;
+        // a concurrently read value is still an ancestor, so the passes stay correct.
         unique_ptr<atomic<int>[]> best_a(new atomic<int>[lsz]);
         atomic<int>* best = best_a.get();
-        size_t n = 0;
-        for (size_t k = 0; k < lsz; k++)
-            if (SL[k].load(memory_order_relaxed)) {
-                parent[k] = parent[parent[k]]; n++;
+        const size_t BLK = 65536, NBLK = (lsz + BLK - 1) / BLK;
+        for (;;) {
+            atomic<bool> changed{false};
+            par(NBLK, [&](size_t i, int) {
+                size_t e = min(lsz, (i + 1) * BLK);
+                bool ch = false;
+                for (size_t k = i * BLK; k < e; k++) {
+                    if (!SL[k].load(memory_order_relaxed)) continue;
+                    int p = __atomic_load_n(&parent[k], __ATOMIC_RELAXED);
+                    int pp = __atomic_load_n(&parent[p], __ATOMIC_RELAXED);
+                    if (p != pp) { __atomic_store_n(&parent[k], pp, __ATOMIC_RELAXED); ch = true; }
+                }
+                if (ch) changed.store(true, memory_order_relaxed);
+            });
+            if (!changed.load()) break;
+        }
+        vector<size_t> nblk(NBLK, 0);
+        par(NBLK, [&](size_t i, int) {
+            size_t e = min(lsz, (i + 1) * BLK), c = 0;
+            for (size_t k = i * BLK; k < e; k++) {
+                if (!SL[k].load(memory_order_relaxed)) continue;
+                c++;
                 if (parent[k] == (int)k) best[k].store((int)k, memory_order_relaxed);
             }
+            nblk[i] = c;
+        });
+        size_t n = 0;
+        for (size_t c : nblk) n += c;
         // byte-wise smallest ID per component, by CAS
-        const size_t BLK = 65536, NBLK = (lsz + BLK - 1) / BLK;
         par(NBLK, [&](size_t i, int) {
             size_t e = min(lsz, (i + 1) * BLK);
             for (size_t k = i * BLK; k < e; k++) {
@@ -1049,7 +1076,13 @@ int main() {
         vector<i64> catsum(NCAT, 0);
         for (size_t p = 0; p < P; p++) {
             E* a = evs.data() + start[p]; E* ae = evs.data() + start[p + 1];
-            sort(a, ae, [](const E& x, const E& y) { return x.ts < y.ts; });
+            if (ae - a <= 24) {   // most people have a handful of events: plain insertion sort
+                for (E* x = a + 1; x < ae; x++) {
+                    E v = *x; E* y = x;
+                    while (y > a && y[-1].ts > v.ts) { *y = y[-1]; y--; }
+                    *y = v;
+                }
+            } else sort(a, ae, [](const E& x, const E& y) { return x.ts < y.ts; });
             const CRec** c = cls.data() + cstart[p]; const CRec** ce = cls.data() + cstart[p + 1];
             sort(c, ce, [](const CRec* x, const CRec* y) {
                 if (x->ts != y->ts) return x->ts < y->ts;
