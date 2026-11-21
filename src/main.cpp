@@ -108,6 +108,7 @@ struct StrMap {
 
 // ---------------------------------------------------------------- files
 struct MFile { const char* p; size_t n; };
+static const size_t PAD = 65536;
 static vector<MFile> list_csv(const string& dir) {
     vector<MFile> out;
     DIR* d = opendir(dir.c_str());
@@ -127,7 +128,11 @@ static vector<MFile> list_csv(const string& dir) {
         if (!S_ISREG(st.st_mode)) { close(fd); continue; }
         size_t n = st.st_size;
         if (n == 0) { close(fd); continue; }
-        void* m = mmap(nullptr, n, PROT_READ, MAP_PRIVATE, fd, 0);
+        // Reserve the file plus 64 KB of zero pages after it, so SIMD loads may run past any field.
+        size_t pg = 4096, mapped = (n + pg - 1) / pg * pg;
+        void* r = mmap(nullptr, mapped + PAD, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (r == MAP_FAILED) { perror("mmap"); exit(2); }
+        void* m = mmap(r, n, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
         close(fd);
         if (m == MAP_FAILED) { perror("mmap"); exit(2); }
         madvise(m, n, MADV_SEQUENTIAL);
@@ -276,7 +281,7 @@ static inline i64 days_from_civil(i64 y, unsigned m, unsigned d) {
 static inline bool isd(char c) { return (unsigned)(c - '0') < 10; }
 static inline int d2(const char* p) { return (p[0] - '0') * 10 + (p[1] - '0'); }
 // Parses F1/F2/F3. Returns false for a bad form. F3 values too large become INT64_MAX (outside every window).
-static inline bool parse_ts(const char* p, u32 n, i64& out) {
+static inline bool parse_ts_slow(const char* p, u32 n, i64& out) {
     if (n == 0) return false;
     if (isd(p[0]) && n != 20 && n != 25) goto f3;
     if (n == 20 || n == 25) {
@@ -317,6 +322,62 @@ f3:
         out = v;
         return true;
     }
+}
+
+
+// Same contract as parse_ts_slow; needs 32 readable bytes at p (files are padded, see list_csv).
+static inline bool parse_ts(const char* p, u32 n, i64& out) {
+    const __m128i z = _mm_set1_epi8('0'), nine = _mm_set1_epi8(9);
+    __m128i v0 = _mm_loadu_si128((const __m128i*)p), v1 = _mm_loadu_si128((const __m128i*)(p + 16));
+    __m128i d0 = _mm_sub_epi8(v0, z), d1 = _mm_sub_epi8(v1, z);
+    u32 dig = (u32)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d0, nine), d0)) |
+              ((u32)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d1, nine), d1)) << 16);
+    if (n == 20 || n == 25) {
+        // digits at 0-3,5-6,8-9,11-12,14-15,17-18 ; '-' 4,7 ; 'T' 10 ; ':' 13,16
+        const u32 DIG = 0x6DB6F;  // bits 0,1,2,3,5,6,8,9,11,12,14,15,17,18
+        const __m128i sep0 = _mm_setr_epi8(0, 0, 0, 0, '-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0);
+        u32 eq0 = (u32)_mm_movemask_epi8(_mm_cmpeq_epi8(v0, sep0));
+        bool shape = (dig & DIG) == DIG && (eq0 & 0x2490) == 0x2490 && p[16] == ':';
+        if (shape) {
+            i64 off = 0;
+            bool bad = false;
+            if (n == 20) bad = p[19] != 'Z';
+            else {
+                char sg = p[19];
+                bad = (sg != '+' && sg != '-') || (dig & 0x1B00000) != 0x1B00000 || p[22] != ':';
+                int oh = d2(p + 20), om = d2(p + 23);
+                bad |= oh > 23 || om > 59;
+                off = (i64)(oh * 60 + om) * 60000;
+                if (sg == '-') off = -off;
+            }
+            int Y = d2(p) * 100 + d2(p + 2), M = d2(p + 5), D = d2(p + 8), h = d2(p + 11), mi = d2(p + 14), se = d2(p + 17);
+            static const uint8_t mdays[13] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+            bad |= M < 1 || M > 12 || D < 1 || h > 23 || mi > 59 || se > 59;
+            if (bad) return false;
+            int md = mdays[M] + (M == 2 && ((Y % 4 == 0 && Y % 100 != 0) || Y % 400 == 0));
+            if (D > md) return false;
+            out = ((days_from_civil(Y, M, D) * 24 + h) * 60 + mi) * 60000 + (i64)se * 1000 - off;
+            return true;
+        }
+        // not the F1/F2 shape: only an all-digit F3 can still be valid (handled below)
+    }
+    if (n == 0) return false;
+    if (n <= 16) {
+        if ((dig & ((1u << n) - 1)) != ((1u << n) - 1)) return false;
+        // right-align the n digits into 16 lanes (zeros in front), then multiply-add pairs up
+        alignas(16) static const uint8_t base[32] = {0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                                                     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+        __m128i sh = _mm_loadu_si128((const __m128i*)(base + n));
+        __m128i x = _mm_shuffle_epi8(d0, sh);
+        __m128i t1 = _mm_maddubs_epi16(x, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+        __m128i t2 = _mm_madd_epi16(t1, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+        __m128i t3 = _mm_packus_epi32(t2, t2);
+        __m128i t4 = _mm_madd_epi16(t3, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
+        u64 hi = (u32)_mm_cvtsi128_si32(t4), lo = (u32)_mm_extract_epi32(t4, 1);
+        out = (i64)(hi * 100000000ULL + lo);
+        return true;
+    }
+    return parse_ts_slow(p, n, out);
 }
 
 // ---------------------------------------------------------------- records
@@ -505,7 +566,8 @@ int main() {
         size_t q2 = man.find('"', q1 + 1);
         string v = man.substr(q1 + 1, q2 - q1 - 1);
         i64 out;
-        if (!parse_ts(v.data(), (u32)v.size(), out)) { fprintf(stderr, "bad manifest ts %s\n", v.c_str()); exit(2); }
+        char buf[128] = {0}; memcpy(buf, v.data(), min<size_t>(v.size(), 64));
+        if (v.size() > 64 || !parse_ts(buf, (u32)v.size(), out)) { fprintf(stderr, "bad manifest ts %s\n", v.c_str()); exit(2); }
         return out;
     };
     const i64 WS = getv("window_start"), WE = getv("window_end");
