@@ -4,3 +4,4 @@ build/
 vendor/
 .venv/
 dev/
+__pycache__/
