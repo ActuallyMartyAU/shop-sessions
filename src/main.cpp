@@ -269,6 +269,58 @@ template <int NF, class F> static void scan_chunk(const Chunk& c, F&& f) {
     if (ls < c.e) finish(c.e);
 }
 
+// Line-at-a-time AVX2 scanner (same contract as scan_chunk). Needs 128 readable bytes past any line start
+// (file mappings are padded). Lines longer than 128 bytes take the scalar split_fields path.
+template <int NF, class F> static void scan_lines(const Chunk& c, F&& f) {
+    const __m256i vc = _mm256_set1_epi8(','), vq = _mm256_set1_epi8('"'), vn = _mm256_set1_epi8('\n');
+    Fld fl[NF];
+    const char* s = c.b;
+    const char* E = c.e;
+    while (s < E) {
+        __m256i a0 = _mm256_loadu_si256((const __m256i*)s), a1 = _mm256_loadu_si256((const __m256i*)(s + 32));
+        __m256i a2 = _mm256_loadu_si256((const __m256i*)(s + 64)), a3 = _mm256_loadu_si256((const __m256i*)(s + 96));
+#define MM(v, ch) ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, ch)))
+        u64 n0 = MM(a0, vn) | (MM(a1, vn) << 32), n1 = MM(a2, vn) | (MM(a3, vn) << 32);
+        u32 L;
+        if (n0) L = __builtin_ctzll(n0);
+        else if (n1) L = 64 + __builtin_ctzll(n1);
+        else L = 128;
+        if ((size_t)(E - s) < L) L = (u32)(E - s);
+        const char* le = s + L;
+        if (L >= 128) {  // long line: scalar path
+            const char* nl = (const char*)memchr(s, '\n', E - s);
+            le = nl ? nl : E;
+            Fld g[NF];
+            if (split_fields(s, le, g, NF)) f(g);
+            s = le + 1;
+            continue;
+        }
+        u64 b0 = L >= 64 ? ~0ULL : ((1ULL << L) - 1), b1 = L <= 64 ? 0 : ((1ULL << (L - 64)) - 1);
+        u64 c0 = (MM(a0, vc) | (MM(a1, vc) << 32)) & b0, c1 = (MM(a2, vc) | (MM(a3, vc) << 32)) & b1;
+        if (__builtin_popcountll(c0) + __builtin_popcountll(c1) == NF - 1) {
+            const char* fs = s;
+            int k = 0;
+            while (c0) { const char* q = s + __builtin_ctzll(c0); c0 &= c0 - 1; fl[k++] = {fs, (u32)(q - fs)}; fs = q + 1; }
+            while (c1) { const char* q = s + 64 + __builtin_ctzll(c1); c1 &= c1 - 1; fl[k++] = {fs, (u32)(q - fs)}; fs = q + 1; }
+            fl[NF - 1] = {fs, (u32)(le - fs)};
+            u64 q0 = (MM(a0, vq) | (MM(a1, vq) << 32)) & b0, q1 = (MM(a2, vq) | (MM(a3, vq) << 32)) & b1;
+            int nq = __builtin_popcountll(q0) + __builtin_popcountll(q1);
+            bool ok = true;
+            if (nq) {
+                int exp = 0;
+                for (int j = 0; j < NF; j++) {
+                    Fld& x = fl[j];
+                    if (x.n >= 2 && x.p[0] == '"' && x.p[x.n - 1] == '"') { exp += 2; x.p++; x.n -= 2; }
+                }
+                ok = exp == nq;
+            }
+            if (ok) f(fl);
+        }
+#undef MM
+        s = le + 1;
+    }
+}
+
 // ---------------------------------------------------------------- timestamps
 static inline i64 days_from_civil(i64 y, unsigned m, unsigned d) {
     y -= m <= 2;
@@ -643,7 +695,7 @@ int main() {
         vector<vector<u64>> hs(ch.size());
         par(ch.size(), [&](size_t i, int) {
             auto& v = pairs[i]; auto& h = hs[i];
-            scan_chunk<2>(ch[i], [&](Fld* f) {
+            scan_lines<2>(ch[i], [&](Fld* f) {
                 if (f[0].n == 0 || f[1].n == 0) return;
                 v.push_back(f[0]); v.push_back(f[1]);
                 h.push_back(hash_str(f[0].p, f[0].n)); h.push_back(hash_str(f[1].p, f[1].n));
@@ -763,7 +815,7 @@ int main() {
         par(ne + cch.size(), [&](size_t i, int tid) {
             if (i < ne) {
                 auto& B = evb[tid];
-                scan_chunk<7>(ech[i], [&](Fld* f) {
+                scan_lines<7>(ech[i], [&](Fld* f) {
                     if (f[0].n == 0) return;
                     EvRec r;
                     r.eid = f[0].p; r.eidlen = f[0].n;
@@ -806,7 +858,7 @@ int main() {
                 });
             } else {
                 auto& Q = clq[tid];
-                scan_chunk<4>(cch[i - ne], [&](Fld* f) {
+                scan_lines<4>(cch[i - ne], [&](Fld* f) {
                     if (f[0].n == 0 || f[1].n == 0) return;
                     i64 ts;
                     if (!parse_ts(f[3].p, f[3].n, ts) || ts < CWS || ts >= WE) return;
@@ -889,7 +941,12 @@ int main() {
     // ------------------------------------------------ per person: sessions, attribution
     vector<vector<URow>> urows(NT);
     vector<vector<CAgg>> cagg(NT, vector<CAgg>((size_t)(NCAMP + 1) * ND, CAgg{0, 0, 0, 0}));
-    par(NQ, [&](size_t q, int tid) {
+    // Largest partitions first (LPT scheduling), so a whale person never starts last and sets the makespan.
+    vector<size_t> qorder(NQ), qsize(NQ, 0);
+    for (int q = 0; q < NQ; q++) { qorder[q] = q; for (int t = 0; t < NT; t++) qsize[q] += evq[t][q].size(); }
+    sort(qorder.begin(), qorder.end(), [&](size_t a, size_t b) { return qsize[a] > qsize[b]; });
+    par(NQ, [&](size_t qi, int tid) {
+        const size_t q = qorder[qi];
         size_t n = 0, nc = 0;
         for (int t = 0; t < NT; t++) { n += evq[t][q].size(); nc += clq[t][q].size(); }
         if (n == 0) return;
