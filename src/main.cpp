@@ -907,21 +907,35 @@ int main() {
                 for (int k = 0; k < pn; k++) resolve(pend[(ph + k) % PK]);
             } else {
                 auto& Q = clq[tid];
+                // Same prefetch FIFO as events: a click waits while its link slot is fetched.
+                const int CK = 16;
+                struct CPend { CRec r; bool lk; };
+                CPend pend[CK];
+                int ph = 0, pn = 0;
+                auto resolve = [&](CPend& e) {
+                    CRec& r = e.r;
+                    int li = e.lk ? lfind(r.h) : -1;
+                    if (li >= 0) { r.name = lk[li].name; r.namelen = lk[li].namelen; r.h = lk[li].nameh; }
+                    Q[r.h >> (64 - QSH)].push_back(r);
+                };
                 scan_lines<4>(cch[i - ne], [&](Fld* f) {
                     if (f[0].n == 0 || f[1].n == 0) return;
                     i64 ts;
                     if (!parse_ts(f[3].p, f[3].n, ts) || ts < CWS || ts >= WE) return;
                     int c = campmap.find(f[2].p, f[2].n);
                     if (c < 0) return;
-                    CRec r;
+                    CPend e;
+                    CRec& r = e.r;
                     r.name = f[1].p; r.namelen = f[1].n;
                     r.h = hash_str(r.name, r.namelen);
-                    int li = lfind(r.h);
-                    if (li >= 0) { r.name = lk[li].name; r.namelen = lk[li].namelen; r.h = lk[li].nameh; }
                     r.cid = f[0].p; r.cidlen = f[0].n;
                     r.ts = ts; r.camp = (uint16_t)c;
-                    Q[r.h >> (64 - QSH)].push_back(r);
+                    e.lk = maybe_linked(r.h);
+                    if (e.lk) __builtin_prefetch(&lk[r.h & lmask]);
+                    if (pn == CK) { resolve(pend[ph]); pend[ph] = e; ph = (ph + 1) % CK; }
+                    else pend[(ph + pn++) % CK] = e;
                 });
+                for (int k = 0; k < pn; k++) resolve(pend[(ph + k) % CK]);
             }
         });
     }
