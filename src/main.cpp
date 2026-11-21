@@ -446,13 +446,12 @@ struct EvRec {      // a parsed event copy, partitioned by event_id hash
     uint8_t cat;
     uint8_t valid;  // bit0 valid, bit1 lost dedup
 };
-struct PRec {       // a surviving event, partitioned by person
+struct PRec {       // a surviving event, partitioned by person (32 bytes)
     u64 h;
     const char* name;
-    i64 ts;
+    u32 ts;         // ms since window_start (a valid event is inside the window)
     u32 namelen;
-    int32_t price;
-    uint8_t cat;
+    u32 pc;         // price | cat << 24 (price is 0 or 1..10,000,000 < 2^24)
 };
 struct CRec {       // a valid click, partitioned by person
     u64 h;
@@ -922,7 +921,7 @@ int main() {
                 int id = lfind(r.uh);
                 if (id >= 0) { p.name = lk[id].name; p.namelen = lk[id].namelen; p.h = lk[id].nameh; }
                 else { p.name = r.user; p.namelen = r.userlen; p.h = r.uh; }
-                p.ts = r.ts; p.price = r.price; p.cat = r.cat;
+                p.ts = (u32)(r.ts - WS); p.pc = (u32)r.price | ((u32)r.cat << 24);
                 Q[p.h >> (64 - QSH)].push_back(p);
             }
         };
@@ -972,13 +971,13 @@ int main() {
         size_t P = pers.size();
         vector<u32> start(P + 1, 0);
         for (size_t i = 0; i < P; i++) start[i + 1] = start[i] + cnt[i];
-        struct E { i64 ts; int32_t price; int32_t cat; };
+        struct E { u32 ts; u32 pc; };   // ts relative to window_start; price | cat << 24
         vector<E> evs(n);
         {
             vector<u32> pos(start.begin(), start.end() - 1);
             size_t j = 0;
             for (int t = 0; t < NT; t++)
-                for (auto& r : evq[t][q]) evs[pos[pid[j++]]++] = E{r.ts, r.price, r.cat};
+                for (auto& r : evq[t][q]) evs[pos[pid[j++]]++] = E{r.ts, r.pc};
         }
         for (int t = 0; t < NT; t++) vector<PRec>().swap(evq[t][q]);
         // clicks
@@ -1030,10 +1029,10 @@ int main() {
             };
             E* s = a;
             while (s < ae) {
-                i64 S = s->ts;
+                i64 S = (i64)s->ts + WS;
                 E* x = s + 1;
-                i64 prev = S;
-                while (x < ae && x->ts - prev <= GAP_MS) { prev = x->ts; x++; }
+                u32 prev = s->ts;
+                while (x < ae && x->ts - prev <= (u32)GAP_MS) { prev = x->ts; x++; }
                 // session [s, x)
                 int day = (int)(floordiv(S, DAY_MS) - DAY0);
                 if (day != cur.day) {
@@ -1042,7 +1041,7 @@ int main() {
                 }
                 i64 rev = 0;
                 for (E* y = s; y < x; y++)
-                    if (y->price > 0) { rev += y->price; catsum[y->cat] += y->price; anycat = true; }
+                    if (u32 pr = y->pc & 0xFFFFFF) { rev += pr; catsum[y->pc >> 24] += pr; anycat = true; }
                 cur.sessions++; cur.events += x - s; cur.revenue += rev;
                 // attribution
                 while (hi < ncl && c[hi]->ts <= S) {
