@@ -634,6 +634,9 @@ int main() {
     size_t lsz = 16; u64 lmask = 15;
     unique_ptr<atomic<u64>[]> lslots_a;
     unique_ptr<LinkEnt[]> lent_a;
+    // Lookup table, same slots: an event/click user ID matches a link ID by full 64-bit hash.
+    struct LinkKey { u64 idh, nameh; const char* name; u32 namelen, occ; };
+    unique_ptr<LinkKey[]> lk_a;
     {
         vector<Chunk> ch = make_chunks(lkf, 1 << 20);
         vector<vector<Fld>> pairs(ch.size());
@@ -706,6 +709,12 @@ int main() {
             }
         });
         vector<u64> nh(lsz);
+        lk_a.reset(new LinkKey[lsz]);
+        LinkKey* LK = lk_a.get();
+        par((lsz + 65535) / 65536, [&](size_t i, int) {
+            size_t e = min(lsz, (i + 1) * 65536);
+            memset((void*)(LK + i * 65536), 0, (e - i * 65536) * sizeof(LinkKey));
+        });
         par((lsz + 65535) / 65536, [&](size_t i, int) {
             size_t e = min(lsz, (i + 1) * 65536);
             for (size_t k = i * 65536; k < e; k++) if (SL[k].load(memory_order_relaxed)) nh[k] = LE[k].nameh;
@@ -716,20 +725,21 @@ int main() {
                 if (!SL[k].load(memory_order_relaxed)) continue;
                 int bb = best[parent[k]];
                 LE[k].name = LE[bb].id; LE[k].namelen = LE[bb].idlen; LE[k].nameh = nh[bb];
+                LK[k] = LinkKey{nh[k], nh[bb], LE[bb].id, LE[bb].idlen, 1};
             }
         });
         fprintf(stderr, "links: %zu ids\n", n);
     }
     logt("links");
     const atomic<u64>* lslots = lslots_a.get();
-    const LinkEnt* lent = lent_a.get();
-    // link slot for (s, n, h), or -1
-    auto lfind = [&](const char* s, u32 n, u64 h) -> int {
-        u64 want = ((u64)(u32)(h >> 32) << 32) | 2;
+    (void)lslots;
+    const LinkKey* lk = lk_a.get();
+    // link slot for user hash h, or -1
+    auto lfind = [&](u64 h) -> int {
         for (u64 k = h & lmask;; k = (k + 1) & lmask) {
-            u64 e = lslots[k].load(memory_order_relaxed);
-            if (!e) return -1;
-            if (e == want && seq(lent[k].id, lent[k].idlen, s, n)) return (int)k;
+            const LinkKey& e = lk[k];
+            if (!e.occ) return -1;
+            if (e.idh == h) return (int)k;
         }
     };
 
@@ -807,8 +817,8 @@ int main() {
                     CRec r;
                     r.name = f[1].p; r.namelen = f[1].n;
                     r.h = hash_str(r.name, r.namelen);
-                    int li = lfind(r.name, r.namelen, r.h);
-                    if (li >= 0) { r.name = lent[li].name; r.namelen = lent[li].namelen; r.h = lent[li].nameh; }
+                    int li = lfind(r.h);
+                    if (li >= 0) { r.name = lk[li].name; r.namelen = lk[li].namelen; r.h = lk[li].nameh; }
                     r.cid = f[0].p; r.cidlen = f[0].n;
                     r.ts = ts; r.camp = (uint16_t)c;
                     Q[r.h >> (64 - QSH)].push_back(r);
@@ -855,26 +865,12 @@ int main() {
         const int BATCH = 32;
         const EvRec* bat[BATCH];
         auto flush = [&](int m) {
-            for (int j = 0; j < m; j++) { __builtin_prefetch(&lslots[bat[j]->uh & lmask]); __builtin_prefetch(bat[j]->user); }
-            int li[BATCH];
-            for (int j = 0; j < m; j++) {
-                const EvRec& r = *bat[j];
-                u32 tag = (u32)(r.uh >> 32);
-                li[j] = -1;
-                u64 want = ((u64)tag << 32) | 2;
-                for (u64 k = r.uh & lmask;; k = (k + 1) & lmask) {
-                    u64 e = lslots[k].load(memory_order_relaxed);
-                    if (!e) break;
-                    if (e == want) { li[j] = (int)k; __builtin_prefetch(&lent[k]); break; }
-                }
-            }
-            for (int j = 0; j < m; j++) if (li[j] >= 0) __builtin_prefetch(lent[li[j]].id);
+            for (int j = 0; j < m; j++) __builtin_prefetch(&lk[bat[j]->uh & lmask]);
             for (int j = 0; j < m; j++) {
                 const EvRec& r = *bat[j];
                 PRec p;
-                int id = li[j];
-                if (id >= 0 && !seq(lent[id].id, lent[id].idlen, r.user, r.userlen)) id = lfind(r.user, r.userlen, r.uh);
-                if (id >= 0) { p.name = lent[id].name; p.namelen = lent[id].namelen; p.h = lent[id].nameh; }
+                int id = lfind(r.uh);
+                if (id >= 0) { p.name = lk[id].name; p.namelen = lk[id].namelen; p.h = lk[id].nameh; }
                 else { p.name = r.user; p.namelen = r.userlen; p.h = r.uh; }
                 p.ts = r.ts; p.price = r.price; p.cat = r.cat;
                 Q[p.h >> (64 - QSH)].push_back(p);
