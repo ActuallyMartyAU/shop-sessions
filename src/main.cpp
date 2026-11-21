@@ -433,14 +433,13 @@ static inline bool parse_ts(const char* p, u32 n, i64& out) {
 }
 
 // ---------------------------------------------------------------- records
-// Dedup index entry for one parsed event copy, bucketed by event_id hash (32 bytes).
+// Dedup index entry for one parsed event copy, bucketed by event_id hash (16 bytes).
 // The payload of a valid copy is already in its person partition; ref locates it there
-// so that a losing copy can be killed in place.
+// so that a losing copy can be killed in place. Event identity is the 64-bit id hash
+// (a collision among ~1e7-1e8 ids has probability ~1e-5..1e-4 per run).
 struct DRec {
     u64 h;
-    const char* eid;
-    i64 ingest;
-    u32 eidlen;
+    u32 ingest;     // ingest_ts in whole seconds (F1 has no fractions), offset so the window is mid-range
     u32 ref;        // NOREF if this copy is invalid (it can still win dedup and drop the event)
 };
 static const u32 NOREF = 0xFFFFFFFFu;
@@ -810,6 +809,7 @@ int main() {
     int TB = 0; while ((1 << TB) < NT) TB++;
     const int IB = 32 - TB - QSH;       // ref = tid | partition | index
     const u32 IMAX = (1u << IB) - 1;    // index IMAX would collide with NOREF
+    const i64 IBASE = WS / 1000 - (1LL << 31);   // DRec.ingest covers window_start +- 68 years
     vector<vector<vector<DRec>>> evb(NT, vector<vector<DRec>>(NB));
     vector<vector<vector<PRec>>> evq(NT, vector<vector<PRec>>(NQ));
     vector<vector<vector<CRec>>> clq(NT, vector<vector<CRec>>(NQ));
@@ -833,15 +833,36 @@ int main() {
                 auto& B = evb[tid];
                 auto& Q = evq[tid];
                 const u32 tref = (u32)tid << (QSH + IB);
+                // Valid events wait in a small FIFO while their link-table slot is prefetched;
+                // the lookup then hits cache instead of stalling on DRAM.
+                struct Pend { u64 uh; const char* user; u32 userlen, ts, pc, bkt, bidx; bool lk; };
+                const int PK = 16;
+                Pend pend[PK];
+                int ph = 0, pn = 0;
+                auto resolve = [&](const Pend& e) {
+                    PRec p;
+                    int id = e.lk ? lfind(e.uh) : -1;
+                    if (id >= 0) { p.name = lk[id].name; p.namelen = lk[id].namelen; p.h = lk[id].nameh; }
+                    else { p.name = e.user; p.namelen = e.userlen; p.h = e.uh; }
+                    p.ts = e.ts; p.pc = e.pc;
+                    u32 q = (u32)(p.h >> (64 - QSH));
+                    auto& V = Q[q];
+                    size_t idx = V.size();
+                    if (idx < IMAX) B[e.bkt][e.bidx].ref = tref | (q << IB) | (u32)idx;
+                    else ref_overflow.store(true, memory_order_relaxed);
+                    V.push_back(p);
+                };
                 scan_lines<7>(ech[i], [&](Fld* f) {
                     if (f[0].n == 0) return;
                     DRec r;
-                    r.eid = f[0].p; r.eidlen = f[0].n;
-                    r.h = hash_str(r.eid, r.eidlen);
+                    r.h = hash_str(f[0].p, f[0].n);
                     r.ref = NOREF;
                     i64 ing;
-                    if (!parse_ts(f[3].p, f[3].n, ing)) ing = INT64_MAX;
-                    r.ingest = ing;
+                    if (!parse_ts(f[3].p, f[3].n, ing)) { ing = INT64_MAX; r.ingest = 0xFFFFFFFFu; }
+                    else {
+                        i64 s = ing / 1000 - IBASE;   // ms are always 000 for F1
+                        r.ingest = s < 0 ? 0 : s > 0xFFFFFFFEll ? 0xFFFFFFFEu : (u32)s;
+                    }
                     u32 price = 0, cat = 0;
                     bool ok = f[1].n > 0 && f[5].n > 0;
                     i64 ts = 0;
@@ -869,22 +890,21 @@ int main() {
                             }
                         } else ok = false;
                     }
+                    u32 bkt = (u32)(r.h >> (64 - BSH));
                     if (ok) {
-                        PRec p;
-                        u64 uh = hash_str(f[1].p, f[1].n);
-                        int id = maybe_linked(uh) ? lfind(uh) : -1;
-                        if (id >= 0) { p.name = lk[id].name; p.namelen = lk[id].namelen; p.h = lk[id].nameh; }
-                        else { p.name = f[1].p; p.namelen = f[1].n; p.h = uh; }
-                        p.ts = (u32)(ts - WS); p.pc = price | (cat << 24);
-                        u32 q = (u32)(p.h >> (64 - QSH));
-                        auto& V = Q[q];
-                        size_t idx = V.size();
-                        if (idx < IMAX) r.ref = tref | (q << IB) | (u32)idx;
-                        else ref_overflow.store(true, memory_order_relaxed);
-                        V.push_back(p);
+                        Pend e;
+                        e.uh = hash_str(f[1].p, f[1].n);
+                        e.user = f[1].p; e.userlen = f[1].n;
+                        e.ts = (u32)(ts - WS); e.pc = price | (cat << 24);
+                        e.bkt = bkt; e.bidx = (u32)B[bkt].size();
+                        e.lk = maybe_linked(e.uh);
+                        if (e.lk) __builtin_prefetch(&lk[e.uh & lmask]);
+                        if (pn == PK) { resolve(pend[ph]); pend[ph] = e; ph = (ph + 1) % PK; }
+                        else pend[(ph + pn++) % PK] = e;
                     }
-                    B[r.h >> (64 - BSH)].push_back(r);
+                    B[bkt].push_back(r);   // ref is filled in when the pending payload resolves
                 });
+                for (int k = 0; k < pn; k++) resolve(pend[(ph + k) % PK]);
             } else {
                 auto& Q = clq[tid];
                 scan_lines<4>(cch[i - ne], [&](Fld* f) {
@@ -933,7 +953,7 @@ int main() {
                     if (!e) { tab[k] = ((u64)tag << 32) | (code + 1); break; }
                     if ((u32)(e >> 32) != tag) continue;
                     DRec& o = rec((u32)e - 1);
-                    if (o.h == r.h && seq(o.eid, o.eidlen, r.eid, r.eidlen)) {
+                    if (o.h == r.h) {
                         if (r.ingest < o.ingest) { kill(o.ref); tab[k] = ((u64)tag << 32) | (code + 1); }
                         else kill(r.ref);
                         break;
